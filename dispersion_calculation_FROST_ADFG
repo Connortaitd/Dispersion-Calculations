@@ -1,0 +1,940 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Oct  9 12:45:51 2026
+
+@author: Connor Davis
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+C = 299792458.0
+PI = np.pi
+
+
+# ============================================================
+# MATERIAL DISPERSION MODELS
+# ============================================================
+
+def sellmeier(lam_um, B, C_coeff):
+    lam_um = np.asarray(lam_um, dtype=float)
+    lam2 = lam_um**2
+    n2 = np.ones_like(lam_um)
+
+    for Bi, Ci in zip(B, C_coeff):
+        n2 += Bi * lam2 / (lam2 - Ci)
+
+    if np.any(n2 <= 0):
+        raise ValueError("Invalid refractive index.")
+
+    return np.sqrt(n2)
+
+
+# Fused silica: Malitson
+FS_B = np.array([0.6961663, 0.4079426, 0.8974794])
+FS_C = np.array([
+    0.0684043**2,
+    0.1162414**2,
+    9.896161**2,
+])
+
+def n_fused_silica(lam_um):
+    return sellmeier(lam_um, FS_B, FS_C)
+
+
+# Calcium fluoride: Malitson
+CAF2_B = np.array([0.5675888, 0.4710914, 3.8484723])
+CAF2_C = np.array([
+    0.050263605**2,
+    0.1003909**2,
+    34.649040**2,
+])
+
+def n_caf2(lam_um):
+    return sellmeier(lam_um, CAF2_B, CAF2_C)
+
+# Silicon: Sellmeier coefficients
+SI_B = np.array([10.6684293, 0.0030434748, 1.54133408])
+SI_C = np.array([0.301516485, 1.13475115, 1104.0])
+
+def n_silicon(lam_um):
+    return sellmeier(lam_um, SI_B, SI_C)
+
+# Air: approximate moist-air dispersion
+def n_air(
+    lam_um,
+    temperature_C=21.5,
+    relative_humidity=30.0,
+    pressure_Pa=101325.0,
+):
+    lam_um = np.asarray(lam_um, dtype=float)
+
+    if np.any(lam_um <= 0):
+        raise ValueError("Wavelength must be positive.")
+
+    if not 0 <= relative_humidity <= 100:
+        raise ValueError("Humidity must be between 0 and 100%.")
+
+    sigma = 1.0 / lam_um
+    T_K = temperature_C + 273.15
+
+    n_standard_minus_1 = 1e-8 * (
+        8342.13
+        + 2406030.0 / (130.0 - sigma**2)
+        + 15997.0 / (38.9 - sigma**2)
+    )
+
+    e_s = 611.21 * np.exp(
+        17.502 * temperature_C / (240.97 + temperature_C)
+    )
+
+    e = relative_humidity / 100.0 * e_s
+    p_dry = pressure_Pa - e
+
+    T_ref = 288.15
+    P_ref = 101325.0
+
+    n_dry_minus_1 = (
+        n_standard_minus_1
+        * (p_dry / P_ref)
+        * (T_ref / T_K)
+    )
+
+    n_water_minus_1 = 1e-8 * (
+        295.235
+        + 2.6422 * sigma**2
+        - 0.032380 * sigma**4
+        + 0.004028 * sigma**6
+    )
+
+    n_water_minus_1 *= (e / P_ref) * (T_ref / T_K)
+
+    return 1.0 + n_dry_minus_1 + n_water_minus_1
+
+
+# Add materials here when needed.
+MATERIALS = {
+    "air": n_air,
+    "fused_silica": n_fused_silica,
+    "caf2": n_caf2,
+    "silicon": n_silicon
+}
+
+
+# ============================================================
+# OPTICAL FUNCTIONS
+# ============================================================
+
+def wavelength_to_omega(wavelength_m):
+    return 2.0 * PI * C / wavelength_m
+
+
+def transmitted_angle(lam_um, n_function, angle_deg):
+    theta_i = np.deg2rad(angle_deg)
+    n_incident = n_air(lam_um)
+    n_transmitted = n_function(lam_um)
+
+    sin_theta_t = (
+        n_incident * np.sin(theta_i) / n_transmitted
+    )
+
+    if np.any(np.abs(sin_theta_t) > 1.0):
+        raise ValueError("No real transmitted angle.")
+
+    return np.arcsin(sin_theta_t)
+
+
+def element_phase(lam_um, element):
+    material = element["material"].lower()
+    thickness_m = float(element["thickness_m"])
+    angle_deg = float(element.get("angle_deg", 0.0))
+
+    if material not in MATERIALS:
+        raise ValueError(f"Unknown material: {material}")
+
+    if thickness_m < 0:
+        raise ValueError("Thickness cannot be negative.")
+
+    n_function = MATERIALS[material]
+    n = n_function(lam_um)
+    lam_m = lam_um * 1e-6
+
+    if material == "air":
+        path_length_m = np.full_like(lam_um, thickness_m)
+        theta_internal = np.full_like(lam_um, np.nan)
+    else:
+        theta_internal = transmitted_angle(
+            lam_um, n_function, angle_deg
+        )
+        path_length_m = thickness_m / np.cos(theta_internal)
+
+    phase = 2.0 * PI * n * path_length_m / lam_m
+
+    return {
+        "phase": phase,
+        "refractive_index": n,
+        "internal_angle_rad": theta_internal,
+        "internal_angle_deg": np.rad2deg(theta_internal),
+        "path_length_m": path_length_m,
+    }
+
+
+# ============================================================
+# DISPERSION CALCULATIONS
+# ============================================================
+
+def remove_constant_and_linear_phase(omega, phase):
+    center = len(omega) // 2
+    omega0 = omega[center]
+    phi0 = phase[center]
+
+    slope = np.gradient(
+        phase, omega, edge_order=2
+    )[center]
+
+    return phase - phi0 - slope * (omega - omega0)
+
+
+def calculate_derivatives(omega, phase):
+    d1 = np.gradient(phase, omega, edge_order=2)
+    d2 = np.gradient(d1, omega, edge_order=2)
+    d3 = np.gradient(d2, omega, edge_order=2)
+    d4 = np.gradient(d3, omega, edge_order=2)
+
+    return {
+        "group_delay_fs": d1 * 1e15,
+        "gdd_fs2": d2 * 1e30,
+        "tod_fs3": d3 * 1e45,
+        "fod_fs4": d4 * 1e60,
+    }
+
+# ============================================================
+# GENERAL PULSE CALCULATOR
+# ============================================================
+
+def calculate_pulse(wavelength_nm, elements, name="Pulse"):
+    """
+    Calculate spectral phase and dispersion for an arbitrary
+    sequence of optical elements.
+
+    Parameters
+    ----------
+    wavelength_nm : array
+        Vacuum wavelengths in nm.
+
+    elements : list of dictionaries
+        Each element specifies:
+            name
+            material
+            thickness_m
+            angle_deg (optional; defaults to zero)
+
+    name : str
+        Pulse name.
+
+    Returns
+    -------
+    dict
+        Total phase, individual contributions, geometry,
+        group delay, GDD, TOD and FOD.
+    """
+
+    wavelength_nm = np.asarray(wavelength_nm, dtype=float)
+
+    if wavelength_nm.ndim != 1 or len(wavelength_nm) < 5:
+        raise ValueError(
+            "Wavelength grid must be 1D with at least 5 points."
+        )
+
+    if np.any(wavelength_nm <= 0):
+        raise ValueError("Wavelengths must be positive.")
+
+    if not np.all(np.isfinite(wavelength_nm)):
+        raise ValueError("Wavelength grid must be finite.")
+
+    if len(np.unique(wavelength_nm)) != len(wavelength_nm):
+        raise ValueError("Wavelengths must be unique.")
+
+    wavelength_um = wavelength_nm / 1000.0
+    wavelength_m = wavelength_nm * 1e-9
+
+    omega = wavelength_to_omega(wavelength_m)
+
+    phase_by_element = {}
+    phase_disp_by_element = {}
+    geometry_by_element = {}
+
+    phase_total = np.zeros_like(wavelength_nm, dtype=float)
+
+    # --------------------------------------------------------
+    # CALCULATE EACH ELEMENT
+    # --------------------------------------------------------
+
+    for index, element in enumerate(elements):
+
+        label = element.get(
+            "name",
+            f"{element['material']}_{index + 1}"
+        )
+
+        if label in phase_by_element:
+            raise ValueError(
+                f"Duplicate element name: {label}"
+            )
+
+        contribution = element_phase(
+            wavelength_um,
+            element
+        )
+
+        phase_by_element[label] = contribution["phase"]
+
+        geometry_by_element[label] = {
+            key: value
+            for key, value in contribution.items()
+            if key != "phase"
+        }
+
+        phase_total += contribution["phase"]
+
+    # --------------------------------------------------------
+    # DISPERSION-ONLY PHASE FOR EACH ELEMENT
+    # --------------------------------------------------------
+
+    for label, phase in phase_by_element.items():
+
+        phase_disp_by_element[label] = (
+            remove_constant_and_linear_phase(
+                omega,
+                phase
+            )
+        )
+
+    # --------------------------------------------------------
+    # TOTAL DISPERSION-ONLY PHASE
+    # --------------------------------------------------------
+
+    phase_total_disp = remove_constant_and_linear_phase(
+        omega,
+        phase_total
+    )
+
+    # --------------------------------------------------------
+    # GROUP DELAY, GDD, TOD AND FOD
+    # --------------------------------------------------------
+
+    derivatives = calculate_derivatives(
+        omega,
+        phase_total
+    )
+
+    # --------------------------------------------------------
+    # RETURN RESULTS
+    # --------------------------------------------------------
+
+    return {
+        "name": name,
+        "wavelength_nm": wavelength_nm,
+        "wavelength_um": wavelength_um,
+        "omega": omega,
+        "elements": elements,
+
+        "phase_by_element": phase_by_element,
+        "phase_disp_by_element": phase_disp_by_element,
+        "phase_total": phase_total,
+        "phase_total_disp": phase_total_disp,
+
+        "geometry_by_element": geometry_by_element,
+
+        **derivatives,
+    }
+
+
+# ============================================================
+# PRINT DISPERSION SUMMARY
+# ============================================================
+
+def print_summary(result, wavelengths_to_print):
+    """
+    Print dispersion information at selected wavelengths.
+    """
+
+    wavelength = result["wavelength_nm"]
+
+    print("\n" + "=" * 65)
+    print(f"DISPERSION SUMMARY: {result['name']}")
+    print("=" * 65)
+
+    print("\nOptical path:")
+
+    for element in result["elements"]:
+
+        label = element.get(
+            "name",
+            element["material"]
+        )
+
+        print(
+            f"  {label}: "
+            f"material={element['material']}, "
+            f"thickness/distance="
+            f"{element['thickness_m'] * 1e3:g} mm, "
+            f"external angle="
+            f"{element.get('angle_deg', 0.0):g} deg"
+        )
+
+    for target in wavelengths_to_print:
+
+        index = int(
+            np.argmin(np.abs(wavelength - target))
+        )
+
+        print(
+            f"\nWavelength = {wavelength[index]:.4f} nm"
+        )
+
+        print(
+            f"Group delay = "
+            f"{result['group_delay_fs'][index]:.6f} fs"
+        )
+
+        print(
+            f"GDD = {result['gdd_fs2'][index]:.6f} fs^2"
+        )
+
+        print(
+            f"TOD = {result['tod_fs3'][index]:.6f} fs^3"
+        )
+
+        print(
+            f"FOD = {result['fod_fs4'][index]:.6f} fs^4"
+        )
+
+        print("\nElement geometry:")
+
+        for label, geometry in (
+            result["geometry_by_element"].items()
+        ):
+
+            angle = geometry["internal_angle_deg"][index]
+            path_m = geometry["path_length_m"][index]
+
+            if np.isfinite(angle):
+
+                print(
+                    f"  {label}: "
+                    f"internal angle={angle:.6f} deg, "
+                    f"path length={path_m * 1e3:.6f} mm"
+                )
+
+            else:
+
+                print(
+                    f"  {label}: "
+                    f"path length={path_m:.6f} m"
+                )
+
+
+# ============================================================
+# PLOT TOTAL DISPERSION-ONLY PHASE
+# ============================================================
+
+def plot_phase(result):
+
+    fig, axes = plt.subplots(
+        1, 2,
+        figsize=(14, 5)
+    )
+
+    # --------------------------------------------------------
+    # Phase versus wavelength
+    # --------------------------------------------------------
+
+    axes[0].plot(
+        result["wavelength_nm"],
+        result["phase_total_disp"],
+        linewidth=2,
+    )
+
+    axes[0].set_xlabel(
+        "Vacuum wavelength (nm)"
+    )
+
+    axes[0].set_ylabel(
+        "Dispersion-only phase (rad)"
+    )
+
+    axes[0].set_title(
+        f"{result['name']}: phase vs wavelength"
+    )
+
+    axes[0].grid(
+        True,
+        alpha=0.3
+    )
+
+    # --------------------------------------------------------
+    # Phase versus angular frequency
+    # --------------------------------------------------------
+
+    axes[1].plot(
+        result["omega"] * 1e-15,
+        result["phase_total_disp"],
+        linewidth=2,
+        color="orange",
+    )
+
+    axes[1].set_xlabel(
+        r"Angular frequency ($10^{15}$ rad/s)"
+    )
+
+    axes[1].set_ylabel(
+        "Dispersion-only phase (rad)"
+    )
+
+    axes[1].set_title(
+        f"{result['name']}: phase vs frequency"
+    )
+
+    axes[1].grid(
+        True,
+        alpha=0.3
+    )
+
+    fig.tight_layout()
+
+
+# ============================================================
+# PLOT INDIVIDUAL ELEMENT CONTRIBUTIONS
+# ============================================================
+
+def plot_contributions(result):
+
+    plt.figure(figsize=(10, 6))
+
+    # Each optical element
+    for label, phase in (
+        result["phase_disp_by_element"].items()
+    ):
+
+        plt.plot(
+            result["wavelength_nm"],
+            phase,
+            label=label,
+        )
+
+    # Total phase
+    plt.plot(
+        result["wavelength_nm"],
+        result["phase_total_disp"],
+        linewidth=2.5,
+        color="black",
+        label="Total",
+    )
+
+    plt.xlabel(
+        "Vacuum wavelength (nm)"
+    )
+
+    plt.ylabel(
+        "Dispersion-only phase (rad)"
+    )
+
+    plt.title(
+        f"{result['name']}: spectral phase contributions"
+    )
+
+    plt.grid(
+        True,
+        alpha=0.3
+    )
+
+    plt.legend()
+    plt.tight_layout()
+
+
+# ============================================================
+# COMPARE DISPERSION OF MULTIPLE PULSES
+# ============================================================
+
+def plot_dispersion_comparison(results):
+    """
+    Compare group delay, GDD, TOD and FOD.
+
+    Each pulse is plotted against its own wavelength grid.
+    """
+
+    quantities = [
+        ("group_delay_fs", "Group delay (fs)"),
+        ("gdd_fs2", r"GDD (fs$^2$)"),
+        ("tod_fs3", r"TOD (fs$^3$)"),
+        ("fod_fs4", r"FOD (fs$^4$)"),
+    ]
+
+    fig, axes = plt.subplots(
+        2, 2,
+        figsize=(13, 9)
+    )
+
+    for ax, (key, ylabel) in zip(
+        axes.flat,
+        quantities
+    ):
+
+        for result in results:
+
+            wavelength = result["wavelength_nm"]
+            values = result[key]
+
+            # Avoid edges for higher-order derivatives
+            if key in (
+                "gdd_fs2",
+                "tod_fs3",
+                "fod_fs4"
+            ):
+
+                margin = max(
+                    2,
+                    int(0.05 * len(wavelength))
+                )
+
+                sl = slice(margin, -margin)
+
+                wavelength = wavelength[sl]
+                values = values[sl]
+
+            ax.plot(
+                wavelength,
+                values,
+                label=result["name"],
+            )
+
+        ax.set_xlabel(
+            "Vacuum wavelength (nm)"
+        )
+
+        ax.set_ylabel(ylabel)
+
+        ax.grid(
+            True,
+            alpha=0.3
+        )
+
+        ax.legend()
+
+    fig.tight_layout()
+    
+# ============================================================
+# MAIN PROGRAM
+# ============================================================
+
+if __name__ == "__main__":
+
+    # ========================================================
+    # CONFIGURATION: PULSE 1
+    # ========================================================
+
+    pulse1_wavelength_nm = np.linspace(
+        680.0,
+        825,
+        400
+    )
+
+    pulse1_config = {
+        "name": "Pulse 1",
+        "wavelength_nm": pulse1_wavelength_nm,
+
+        "elements": [
+            {
+                "name": "Air",
+                "material": "air",
+                "thickness_m": 5.0,
+            },
+            {
+                "name": "Fused silica beamsplitter",
+                "material": "fused_silica",
+                "thickness_m": 1e-3,
+                "angle_deg": 45.0,
+            },
+        ],
+    }
+
+
+    # ========================================================
+    # CONFIGURATION: PULSE 2
+    # ========================================================
+
+    # Original pump-wavelength relationship:
+    #
+    # 1/lambda_pulse2 = 1/lambda_pump - 1/lambda_pulse1
+
+    pump_wavelength_nm = 1030
+
+    pulse2_wavelength_nm = 1.0 / (
+        1.0 / pulse1_wavelength_nm
+        - 1.0 / pump_wavelength_nm
+    )
+
+    pulse2_config = {
+        "name": "Pulse 2",
+        "wavelength_nm": pulse2_wavelength_nm,
+
+        "elements": [
+            {
+                "name": "Air",
+                "material": "air",
+                "thickness_m": 2.86,
+            },
+            {
+                "name": "Silicon Filter",
+                "material": "silicon",
+                "thickness_m": 1.08e-3,
+                "angle_deg": 0.0,
+            },
+        ],
+    }
+
+
+    # ========================================================
+    # CALCULATE BOTH PULSES
+    # ========================================================
+
+    pulse1 = calculate_pulse(
+        wavelength_nm=pulse1_config["wavelength_nm"],
+        elements=pulse1_config["elements"],
+        name=pulse1_config["name"],
+    )
+
+    pulse2 = calculate_pulse(
+        wavelength_nm=pulse2_config["wavelength_nm"],
+        elements=pulse2_config["elements"],
+        name=pulse2_config["name"],
+    )
+
+
+    # ========================================================
+    # PRINT DISPERSION SUMMARIES
+    # ========================================================
+
+    pulse1_reference_nm = 745.0
+
+    pulse2_reference_nm = 1.0 / (
+        1.0 / pulse1_reference_nm
+        - 1.0 / pump_wavelength_nm
+    )
+
+    print_summary(
+        pulse1,
+        [pulse1_reference_nm]
+    )
+
+    print_summary(
+        pulse2,
+        [pulse2_reference_nm]
+    )
+
+
+    # ========================================================
+    # PLOT PHASE AND INDIVIDUAL CONTRIBUTIONS
+    # ========================================================
+
+    for pulse in (pulse1, pulse2):
+
+        plot_phase(pulse)
+
+        plot_contributions(pulse)
+
+
+    # ========================================================
+    # COMPARE GROUP DELAY, GDD, TOD AND FOD
+    # ========================================================
+
+    plot_dispersion_comparison(
+        [pulse1, pulse2]
+    )
+
+
+    # ========================================================
+    # PLOT 4: DAZZLER PHASE
+    # ========================================================
+
+    # The pulse wavelength grids are generated by the
+    # user-defined frequency transformation in the main
+    # program. The arrays correspond point-by-point.
+
+    pulse2_phase_transformed = pulse2["phase_total_disp"]
+
+    # Dazzler acts on Pulse 1, the original seed.
+    # Choose its phase to match the transformed Pulse 2 phase.
+    phi_dazzler = (
+        pulse1["phase_total_disp"]
+        -pulse2_phase_transformed
+    )
+
+    # Result after applying the Dazzler to Pulse 1.
+    phi_total_compensated = (
+        phi_dazzler
+        -pulse1["phase_total_disp"]
+        +pulse2_phase_transformed
+    )
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(10, 6)
+    )
+
+    # --------------------------------------------------------
+    # Wavelength
+    # --------------------------------------------------------
+
+    ax1.plot(
+        pulse1["wavelength_nm"],
+        pulse1["phase_total_disp"],
+        linewidth=2,
+        label="Pulse 1 phase"
+    )
+
+    ax1.plot(
+        pulse1["wavelength_nm"],
+        pulse2_phase_transformed,
+        linewidth=2,
+        label="Pulse 2 phase (transformed grid)"
+    )
+
+    ax1.plot(
+        pulse1["wavelength_nm"],
+        phi_dazzler,
+        linewidth=2,
+        label="Required Dazzler phase"
+    )
+
+    ax1.plot(
+        pulse1["wavelength_nm"],
+        phi_total_compensated,
+        "--",
+        linewidth=2,
+        label="Pulse 1 + Dazzler"
+    )
+
+    ax1.set_xlabel("Wavelength (nm)")
+    ax1.set_ylabel("Dispersion-only spectral phase (rad)")
+    ax1.set_title("Phase Compensation")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    # --------------------------------------------------------
+    # Angular frequency
+    # --------------------------------------------------------
+
+    ax2.plot(
+        pulse1["omega"],
+        pulse1["phase_total_disp"],
+        linewidth=2,
+        label="Pulse 1 phase"
+    )
+
+    ax2.plot(
+        pulse1["omega"],
+        pulse2_phase_transformed,
+        linewidth=2,
+        label="Pulse 2 phase (transformed grid)"
+    )
+
+    ax2.plot(
+        pulse1["omega"],
+        phi_dazzler,
+        linewidth=2,
+        label="Required Dazzler phase"
+    )
+
+    ax2.plot(
+        pulse1["omega"],
+        phi_total_compensated,
+        "--",
+        linewidth=2,
+        label="Total Phase"
+    )
+
+    ax2.set_xlabel("Angular frequency (rad/s)")
+    ax2.set_ylabel("Dispersion-only spectral phase (rad)")
+    ax2.set_title("Phase Compensation vs. Angular Frequency")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    
+    # ========================================================
+    # POLYNOMIAL FIT TO DAZZLER PHASE
+    # ========================================================
+
+    wavelength_fit_m = 745e-9
+
+    omega_fit = (
+        2 * np.pi * C / wavelength_fit_m
+    )
+
+    # Fit around the reference angular frequency.
+    # Scaling the offset to units of 10^15 rad/s improves
+    # numerical conditioning.
+
+    omega_offset_scaled = (
+        pulse1["omega"] - omega_fit
+    ) * 1e-15
+
+    polynomial_order = 4
+
+    phase_fit = np.polyfit(
+        omega_offset_scaled,
+        phi_dazzler,
+        polynomial_order
+    )
+
+    fit_function = np.poly1d(phase_fit)
+
+    # Since x = (omega - omega_fit)*1e-15,
+    # these coefficients directly give GDD, TOD and FOD
+    # in fs^2, fs^3 and fs^4, respectively.
+
+    gdd_fit_fs2 = 2 * phase_fit[-3]
+    tod_fit_fs3 = 6 * phase_fit[-4]
+    fod_fit_fs4 = 24 * phase_fit[-5]
+
+    print("\n============================================")
+    print("DAZZLER POLYNOMIAL FIT")
+    print("============================================")
+
+    print(f"Reference wavelength: {wavelength_fit_m * 1e9:.3f} nm")
+    print(f"GDD: {gdd_fit_fs2:.6f} fs^2")
+    print(f"TOD: {tod_fit_fs3:.6f} fs^3")
+    print(f"FOD: {fod_fit_fs4:.6f} fs^4")
+
+    print("Polynomial coefficients (highest order first):")
+    print(phase_fit)
+
+    plt.figure(figsize=(10, 6))
+
+    plt.plot(
+        pulse1["omega"],
+        phi_dazzler,
+        label="Required Dazzler phase"
+    )
+
+    plt.plot(
+        pulse1["omega"],
+        fit_function(omega_offset_scaled),
+        "--",
+        linewidth=2,
+        label="Fourth-degree polynomial fit"
+    )
+
+    plt.xlabel("Angular frequency (rad/s)")
+    plt.ylabel("Phase (rad)")
+    plt.title("Dazzler Phase Polynomial Fit")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+
